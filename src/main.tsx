@@ -3,18 +3,12 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
 import "./index.css";
-import { BrowserRouter } from "react-router-dom";
+import { HashRouter } from "react-router-dom";
 
-const rootElement = document.getElementById("root");
-console.log("main.tsx: Root element:", rootElement);
-
-if (rootElement) {
-  createRoot(rootElement).render(
-    <BrowserRouter>
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <HashRouter>
       <App />
-    </BrowserRouter>,
-  );
-  console.log("main.tsx: Render called");
-} else {
-  console.error("main.tsx: Root element not found!");
-}
+    </HashRouter>
+  </StrictMode>,
+);
