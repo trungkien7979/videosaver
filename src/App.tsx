@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import {
   Download,
   Link as LinkIcon,
@@ -24,7 +24,6 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { GoogleGenAI } from "@google/genai";
 
 // --- Types ---
 
@@ -36,47 +35,413 @@ interface VideoMetadata {
   duration: string;
   quality: string;
   downloadUrl: string;
-  needsExtraction?: boolean;
 }
 
-// --- Gemini Service ---
-// Move this to a place where we check it
-console.log("App.tsx: Loading...");
+// --- Utils ---
 
-const extractVideoLinkWithGemini = async (
-  videoUrl: string,
-  platform: string,
-): Promise<string | null> => {
-  try {
-    const ai = new GoogleGenAI({
-      apiKey:
-        (typeof process !== "undefined"
-          ? process?.env?.GEMINI_API_KEY
-          : undefined) || "",
-    });
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: `Find the direct MP4 video download link for this ${platform} video: ${videoUrl}. 
-      Use your search capabilities to find a reliable direct link or a public API result for this specific video.
-      Return ONLY the direct URL to the .mp4 file or the highest quality video stream available. 
-      If you cannot find a direct link, return "NOT_FOUND".`,
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
-    });
-
-    const text = response.text?.trim() || "";
-    if (text.includes("http") && !text.includes("NOT_FOUND")) {
-      // Extract URL from text if it contains other words
-      const urlMatch = text.match(/https?:\/\/[^\s"']+/);
-      return urlMatch ? urlMatch[0] : null;
-    }
-    return null;
-  } catch (error) {
-    console.error("Gemini extraction failed:", error);
-    return null;
-  }
+const fmtDuration = (seconds: number): string => {
+  if (!seconds || isNaN(seconds)) return "Unknown";
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
 };
+
+const fmtSize = (bytes: number): string =>
+  bytes > 0 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : "Unknown";
+
+// --- Platform Detectors ---
+
+const detectPlatform = (url: string): string => {
+  const u = url.toLowerCase();
+  if (u.includes("tiktok.com")) return "TikTok";
+  if (u.includes("douyin.com") || u.includes("v.douyin")) return "Douyin";
+  if (u.includes("xiaohongshu.com") || u.includes("xhslink.com"))
+    return "Xiaohongshu";
+  if (u.includes("instagram.com")) return "Instagram";
+  if (
+    u.includes("facebook.com") ||
+    u.includes("fb.watch") ||
+    u.includes("fb.com")
+  )
+    return "Facebook";
+  if (u.includes("youtube.com") || u.includes("youtu.be")) return "YouTube";
+  if (u.includes("twitter.com") || u.includes("x.com")) return "Twitter/X";
+  if (u.includes("threads.net")) return "Threads";
+  if (u.includes("reddit.com") || u.includes("redd.it")) return "Reddit";
+  if (u.includes("pinterest.com") || u.includes("pin.it")) return "Pinterest";
+  return "Social Media";
+};
+
+// --- Extractors (Client-Side, CORS-friendly) ---
+
+// TikWM: supports CORS, works for TikTok & Douyin
+async function tryTikWM(
+  url: string,
+  platform: string,
+): Promise<VideoMetadata | null> {
+  try {
+    console.log(`[TikWM] Trying for ${platform}...`);
+    const formData = new URLSearchParams({ url });
+    const response = await fetch("https://www.tikwm.com/api/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: formData.toString(),
+    });
+    const json = await response.json();
+    const data = json?.data;
+    if (data && (data.play || data.wmplay)) {
+      console.log(`[TikWM] ✅ Success`);
+      return {
+        platform,
+        title: data.title || `${platform} Video`,
+        size: fmtSize(data.size || 0),
+        thumbnail:
+          data.cover ||
+          `https://picsum.photos/seed/${platform.toLowerCase()}/800/800`,
+        duration: data.duration ? fmtDuration(data.duration) : "Unknown",
+        quality: "HD No Watermark",
+        downloadUrl: data.play || data.wmplay,
+      };
+    }
+  } catch (e: any) {
+    console.error("[TikWM] Error:", e.message);
+  }
+  return null;
+}
+
+// VxTwitter / FxTwitter: public JSON APIs for Twitter/X
+async function tryTwitterAPI(url: string): Promise<VideoMetadata | null> {
+  // VxTwitter
+  try {
+    console.log("[VxTwitter] Trying...");
+    const apiUrl = url
+      .replace("https://twitter.com/", "https://api.vxtwitter.com/")
+      .replace("https://x.com/", "https://api.vxtwitter.com/");
+    const res = await fetch(apiUrl, {
+      headers: { Accept: "application/json" },
+    });
+    const data = await res.json();
+    const media = data?.media_extended || [];
+    const video = media.find((m: any) => m.type === "video" && m.url);
+    if (video?.url) {
+      console.log("[VxTwitter] ✅ Success");
+      return {
+        platform: "Twitter/X",
+        title: (data.text || data.tweetText || "Twitter/X Video").substring(
+          0,
+          80,
+        ),
+        size: "Unknown",
+        thumbnail:
+          video.thumbnail_url ||
+          media.find((m: any) => m.thumbnail_url)?.thumbnail_url ||
+          "https://picsum.photos/seed/twitter/800/800",
+        duration: video.duration_millis
+          ? fmtDuration(Math.round(video.duration_millis / 1000))
+          : "Unknown",
+        quality: "Best Available",
+        downloadUrl: video.url,
+      };
+    }
+  } catch (e: any) {
+    console.warn("[VxTwitter] Failed:", e.message);
+  }
+
+  // FxTwitter
+  try {
+    console.log("[FxTwitter] Trying...");
+    const fxApiUrl = url
+      .replace("https://twitter.com/", "https://api.fxtwitter.com/")
+      .replace("https://x.com/", "https://api.fxtwitter.com/");
+    const res = await fetch(fxApiUrl, {
+      headers: { Accept: "application/json" },
+    });
+    const data = await res.json();
+    const tweet = data?.tweet;
+    const videos = tweet?.media?.videos;
+    const video = Array.isArray(videos) ? videos[0] : null;
+    if (video?.url) {
+      console.log("[FxTwitter] ✅ Success");
+      return {
+        platform: "Twitter/X",
+        title: (tweet.text || "Twitter/X Video").substring(0, 80),
+        size: "Unknown",
+        thumbnail:
+          video.thumbnail_url ||
+          tweet.author?.avatar_url ||
+          "https://picsum.photos/seed/twitter/800/800",
+        duration: video.duration
+          ? fmtDuration(Math.round(video.duration))
+          : "Unknown",
+        quality: "Best Available",
+        downloadUrl: video.url,
+      };
+    }
+  } catch (e: any) {
+    console.warn("[FxTwitter] Failed:", e.message);
+  }
+
+  return null;
+}
+
+// Reddit: public JSON API
+async function tryRedditAPI(url: string): Promise<VideoMetadata | null> {
+  try {
+    console.log("[Reddit] Trying JSON API...");
+    const jsonUrl = url.split("?")[0].replace(/\/$/, "") + ".json";
+    const res = await fetch(jsonUrl, {
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data)) return null;
+    const post = data[0]?.data?.children?.[0]?.data;
+    if (!post) return null;
+
+    const rv =
+      post.media?.reddit_video ||
+      post.secure_media?.reddit_video ||
+      post.crosspost_parent_list?.[0]?.media?.reddit_video;
+
+    if (rv?.fallback_url) {
+      const videoUrl = rv.fallback_url.replace(/&amp;/g, "&");
+      console.log("[Reddit] ✅ Got video URL");
+      return {
+        platform: "Reddit",
+        title: post.title || "Reddit Video",
+        size: "Unknown",
+        thumbnail: post.thumbnail?.startsWith("http")
+          ? post.thumbnail
+          : "https://picsum.photos/seed/reddit/800/800",
+        duration: rv.duration ? fmtDuration(rv.duration) : "Unknown",
+        quality: rv.height ? `${rv.height}p` : "Best Available",
+        downloadUrl: videoUrl,
+      };
+    }
+  } catch (e: any) {
+    console.error("[Reddit] Error:", e.message);
+  }
+  return null;
+}
+
+// Cobalt API: free public API supporting many platforms (TikTok, Instagram, YouTube, etc.)
+async function tryCobalt(
+  url: string,
+  platform: string,
+): Promise<VideoMetadata | null> {
+  // cobalt.tools public instance
+  const COBALT_INSTANCES = [
+    "https://cobalt.api.timelessnesses.me",
+    "https://co.wuk.sh",
+  ];
+
+  for (const instance of COBALT_INSTANCES) {
+    try {
+      console.log(`[Cobalt] Trying ${instance} for ${platform}...`);
+      const res = await fetch(`${instance}/api/json`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          url,
+          vQuality: "max",
+          filenamePattern: "basic",
+          isNoTTWatermark: true,
+          isTTFullAudio: false,
+          isAudioOnly: false,
+        }),
+      });
+
+      if (!res.ok) continue;
+      const data = await res.json();
+
+      if (
+        data.status === "stream" ||
+        data.status === "redirect" ||
+        data.status === "tunnel"
+      ) {
+        const downloadUrl = data.url;
+        if (downloadUrl) {
+          console.log(`[Cobalt] ✅ Success from ${instance}`);
+          return {
+            platform,
+            title: `${platform} Video`,
+            size: "Unknown",
+            thumbnail: `https://picsum.photos/seed/${platform.toLowerCase()}/800/800`,
+            duration: "Unknown",
+            quality: "Best Available",
+            downloadUrl,
+          };
+        }
+      }
+
+      if (
+        data.status === "picker" &&
+        Array.isArray(data.picker) &&
+        data.picker.length > 0
+      ) {
+        const videoItem = data.picker.find(
+          (p: any) => p.type === "video" || p.url?.includes("mp4"),
+        );
+        const item = videoItem || data.picker[0];
+        if (item?.url) {
+          console.log(`[Cobalt] ✅ Picker success from ${instance}`);
+          return {
+            platform,
+            title: `${platform} Video`,
+            size: "Unknown",
+            thumbnail:
+              item.thumb ||
+              `https://picsum.photos/seed/${platform.toLowerCase()}/800/800`,
+            duration: "Unknown",
+            quality: "Best Available",
+            downloadUrl: item.url,
+          };
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[Cobalt] ${instance} failed:`, e.message);
+    }
+  }
+  return null;
+}
+
+// Savefrom: alternative for various platforms
+async function trySaveFrom(
+  url: string,
+  platform: string,
+): Promise<VideoMetadata | null> {
+  try {
+    console.log(`[SaveFrom] Trying for ${platform}...`);
+    const apiUrl = `https://worker.sf-tools.com/savefrom.php?sf_url=${encodeURIComponent(url)}`;
+    const res = await fetch(apiUrl, {
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.url && Array.isArray(data.url) && data.url.length > 0) {
+      // Get highest quality
+      const sorted = data.url.sort(
+        (a: any, b: any) => (parseInt(b.id) || 0) - (parseInt(a.id) || 0),
+      );
+      const best = sorted[0];
+      if (best?.url) {
+        console.log(`[SaveFrom] ✅ Success`);
+        return {
+          platform,
+          title: data.meta?.title || `${platform} Video`,
+          size: "Unknown",
+          thumbnail:
+            data.meta?.thumb ||
+            `https://picsum.photos/seed/${platform.toLowerCase()}/800/800`,
+          duration: data.meta?.duration
+            ? fmtDuration(parseInt(data.meta.duration))
+            : "Unknown",
+          quality: best.id || "Best Available",
+          downloadUrl: best.url,
+        };
+      }
+    }
+  } catch (e: any) {
+    console.warn("[SaveFrom] Failed:", e.message);
+  }
+  return null;
+}
+
+// --- Main Orchestrator (frontend-only) ---
+
+async function fetchVideoMetadataClient(
+  rawUrl: string,
+): Promise<VideoMetadata> {
+  const url = rawUrl.trim();
+  const platform = detectPlatform(url);
+
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`[Client] 🚀 Processing: ${platform} | ${url.substring(0, 60)}`);
+  console.log(`${"=".repeat(60)}`);
+
+  let metadata: VideoMetadata | null = null;
+
+  if (platform === "TikTok" || platform === "Douyin") {
+    metadata = await tryTikWM(url, platform);
+    if (!metadata) metadata = await tryCobalt(url, platform);
+  } else if (platform === "Twitter/X" || platform === "Threads") {
+    metadata = await tryTwitterAPI(url);
+    if (!metadata) metadata = await tryCobalt(url, platform);
+  } else if (platform === "Reddit") {
+    metadata = await tryRedditAPI(url);
+    if (!metadata) metadata = await tryCobalt(url, platform);
+  } else if (
+    platform === "Instagram" ||
+    platform === "Facebook" ||
+    platform === "YouTube"
+  ) {
+    metadata = await tryCobalt(url, platform);
+  } else if (platform === "Xiaohongshu") {
+    metadata = await tryCobalt(url, platform);
+    if (!metadata) metadata = await tryTikWM(url, platform); // sometimes works
+  } else {
+    metadata = await tryCobalt(url, platform);
+  }
+
+  if (!metadata) {
+    throw new Error(
+      `Không tìm được link tải cho video ${platform} này. Hãy kiểm tra:\n` +
+        `• Video có ở chế độ công khai không?\n` +
+        `• Link có đúng không?\n` +
+        `• Thử lại sau vài giây (API có thể bị giới hạn tạm thời)`,
+    );
+  }
+
+  console.log(
+    `[Client] ✅ ${platform} → ${metadata.downloadUrl.substring(0, 70)}...`,
+  );
+  return metadata;
+}
+
+// --- Download Handler ---
+
+async function triggerDownload(
+  downloadUrl: string,
+  filename: string,
+): Promise<void> {
+  const safeFilename = filename || "video.mp4";
+
+  try {
+    // Try fetch + blob download (works for same-origin or CORS-enabled URLs)
+    const res = await fetch(downloadUrl, { mode: "cors" });
+    if (res.ok) {
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = safeFilename;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 1000);
+      return;
+    }
+  } catch {
+    // CORS blocked — fall through to direct link
+  }
+
+  // Fallback: open in new tab (browser will download or play)
+  const a = document.createElement("a");
+  a.href = downloadUrl;
+  a.download = safeFilename;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => document.body.removeChild(a), 1000);
+}
 
 // --- Components ---
 
@@ -295,8 +660,8 @@ const LandingScreen = ({
               backgroundImage: "radial-gradient(#ffffff 1px, transparent 1px)",
               backgroundSize: "32px 32px",
             }}
-          ></div>
-          <div className="absolute inset-0 z-0 bg-gradient-to-br from-slate-900 via-primary/10 to-slate-900"></div>
+          />
+          <div className="absolute inset-0 z-0 bg-gradient-to-br from-slate-900 via-primary/10 to-slate-900" />
           <div className="relative z-10 flex flex-col items-center justify-center px-6 py-16 text-center md:px-10 md:py-24">
             <h1 className="max-w-4xl text-4xl font-black leading-tight tracking-tight md:text-6xl text-white">
               Download Videos{" "}
@@ -316,7 +681,7 @@ const LandingScreen = ({
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
                     className="w-full flex-1 border-none bg-transparent px-2 py-4 text-slate-900 placeholder:text-slate-400 focus:ring-0 text-lg"
-                    placeholder="Paste video URL here (e.g., TikTok, Instagram)..."
+                    placeholder="Paste video URL here (TikTok, Instagram, Twitter...)..."
                     type="url"
                     required
                     disabled={isLoading}
@@ -347,10 +712,12 @@ const LandingScreen = ({
                     initial={{ opacity: 0, y: -10 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -10 }}
-                    className="mt-4 flex items-center justify-center gap-2 text-red-400 bg-red-400/10 py-2 px-4 rounded-lg border border-red-400/20"
+                    className="mt-4 flex items-start justify-center gap-2 text-red-400 bg-red-400/10 py-3 px-4 rounded-lg border border-red-400/20"
                   >
-                    <AlertCircle className="size-4" />
-                    <span className="text-sm font-medium">{error}</span>
+                    <AlertCircle className="size-4 mt-0.5 flex-shrink-0" />
+                    <span className="text-sm font-medium whitespace-pre-line text-left">
+                      {error}
+                    </span>
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -375,54 +742,32 @@ const LandingScreen = ({
           </p>
         </div>
         <div className="flex flex-wrap justify-center gap-8 md:gap-16 opacity-60 grayscale hover:grayscale-0 transition-all duration-500">
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-black text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              TT
+          {[
+            { label: "TikTok", abbr: "TT", bg: "bg-black" },
+            {
+              label: "Instagram",
+              abbr: "IG",
+              bg: "bg-gradient-to-tr from-yellow-400 via-red-500 to-purple-600",
+            },
+            { label: "Facebook", abbr: "FB", bg: "bg-blue-600" },
+            { label: "YouTube Shorts", abbr: "YT", bg: "bg-red-600" },
+            { label: "Twitter/X", abbr: "TW", bg: "bg-sky-500" },
+            { label: "Xiaohongshu", abbr: "XH", bg: "bg-red-500" },
+            { label: "Threads", abbr: "TH", bg: "bg-black" },
+            { label: "Reddit", abbr: "RD", bg: "bg-orange-600" },
+          ].map(({ label, abbr, bg }) => (
+            <div
+              key={label}
+              className="flex items-center gap-3 group cursor-default"
+            >
+              <div
+                className={`size-10 rounded-full ${bg} text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform`}
+              >
+                {abbr}
+              </div>
+              <span className="font-bold text-slate-700">{label}</span>
             </div>
-            <span className="font-bold text-slate-700">TikTok</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-gradient-to-tr from-yellow-400 via-red-500 to-purple-600 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              IG
-            </div>
-            <span className="font-bold text-slate-700">Instagram</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              FB
-            </div>
-            <span className="font-bold text-slate-700">Facebook</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-red-600 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              YT
-            </div>
-            <span className="font-bold text-slate-700">YouTube Shorts</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-sky-500 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              TW
-            </div>
-            <span className="font-bold text-slate-700">Twitter/X</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-red-500 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              XH
-            </div>
-            <span className="font-bold text-slate-700">Xiaohongshu</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-black text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              TH
-            </div>
-            <span className="font-bold text-slate-700">Threads</span>
-          </div>
-          <div className="flex items-center gap-3 group cursor-default">
-            <div className="size-10 rounded-full bg-orange-600 text-white flex items-center justify-center font-bold text-xs group-hover:scale-110 transition-transform">
-              RD
-            </div>
-            <span className="font-bold text-slate-700">Reddit</span>
-          </div>
+          ))}
         </div>
       </section>
 
@@ -485,7 +830,7 @@ const LandingScreen = ({
                   <div className="size-10 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center">
                     <Play className="size-5 fill-white" />
                   </div>
-                  <div className="h-2 w-32 bg-white/40 rounded-full"></div>
+                  <div className="h-2 w-32 bg-white/40 rounded-full" />
                 </div>
                 <div className="h-2 w-full bg-white/20 rounded-full overflow-hidden">
                   <motion.div
@@ -493,7 +838,7 @@ const LandingScreen = ({
                     animate={{ width: "70%" }}
                     transition={{ duration: 2, repeat: Infinity }}
                     className="h-full bg-primary"
-                  ></motion.div>
+                  />
                 </div>
               </div>
             </div>
@@ -574,6 +919,10 @@ const LandingScreen = ({
               question="Where are videos saved?"
               answer="Videos are usually saved in the 'Downloads' folder on your device or browser default download location."
             />
+            <FAQItem
+              question="Tại sao video không tải được?"
+              answer="Một số video có thể ở chế độ riêng tư hoặc nền tảng chặn. Hãy kiểm tra video có ở chế độ công khai không và thử lại. Nếu nút Download không hoạt động, hãy nhấn chuột phải vào video → Save As."
+            />
           </div>
         </div>
       </section>
@@ -595,9 +944,8 @@ const SuccessScreen = ({
   const [isDownloading, setIsDownloading] = useState(false);
 
   const handleDownloadClick = async (quality: string) => {
-    // Sanitize title: remove non-ASCII / special chars, keep alphanumeric, spaces, hyphens
     const safeTitle = metadata.title
-      .replace(/[^\w\s\-().]/g, "") // strip special/emoji chars
+      .replace(/[^\w\s\-().]/g, "")
       .replace(/\s+/g, "_")
       .substring(0, 60);
     const filename = `${metadata.platform}_${safeTitle || "video"}_${quality}.mp4`;
@@ -633,6 +981,10 @@ const SuccessScreen = ({
             alt="Video Thumbnail"
             className="absolute inset-0 w-full h-full object-cover"
             referrerPolicy="no-referrer"
+            onError={(e) => {
+              (e.target as HTMLImageElement).src =
+                `https://picsum.photos/seed/${metadata.platform}/800/800`;
+            }}
           />
           <div className="absolute inset-0 bg-black/20 flex items-center justify-center group-hover:bg-black/30 transition-all">
             <div className="size-20 bg-white/90 rounded-full flex items-center justify-center shadow-xl backdrop-blur-sm">
@@ -674,9 +1026,16 @@ const SuccessScreen = ({
             {downloadError && (
               <div className="flex items-start gap-3 p-4 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm">
                 <AlertCircle className="size-5 flex-shrink-0 mt-0.5" />
-                <span>{downloadError}</span>
+                <div>
+                  <span>{downloadError}</span>
+                  <p className="mt-2 text-xs">
+                    💡 Thử nhấn chuột phải vào nút Download và chọn "Save link
+                    as..." hoặc mở video trong tab mới.
+                  </p>
+                </div>
               </div>
             )}
+
             <button
               onClick={() => handleDownloadClick("HD")}
               disabled={isDownloading}
@@ -691,15 +1050,20 @@ const SuccessScreen = ({
                     Download HD (No Watermark)
                   </span>
                   <span className="text-sm text-blue-100 opacity-80">
-                    MP4 • 1080p • Best Quality
+                    MP4 • Best Quality
                   </span>
                 </div>
               </div>
+              {isDownloading && <Loader2 className="size-5 animate-spin" />}
             </button>
-            <button
-              onClick={() => handleDownloadClick("4K")}
-              disabled={isDownloading}
-              className="group flex w-full items-center justify-between rounded-2xl bg-secondary hover:bg-indigo-700 text-white px-8 py-5 shadow-lg transition-all active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed"
+
+            {/* Direct link fallback */}
+            <a
+              href={metadata.downloadUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              download
+              className="group flex w-full items-center justify-between rounded-2xl bg-secondary hover:bg-indigo-700 text-white px-8 py-5 shadow-lg transition-all active:scale-[0.98]"
             >
               <div className="flex items-center gap-4">
                 <div className="p-3 bg-white/20 rounded-xl">
@@ -707,14 +1071,15 @@ const SuccessScreen = ({
                 </div>
                 <div className="text-left">
                   <span className="block text-lg font-bold">
-                    Download Original 4K
+                    Open Direct Link
                   </span>
                   <span className="text-sm text-indigo-100 opacity-80">
-                    MP4 • 2160p • Source File
+                    Mở trực tiếp → chuột phải → Save As
                   </span>
                 </div>
               </div>
-            </button>
+            </a>
+
             <button
               onClick={onReset}
               disabled={isDownloading}
@@ -746,30 +1111,11 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [metadata, setMetadata] = useState<VideoMetadata | null>(null);
 
-  const detectPlatform = (url: string) => {
-    const u = url.toLowerCase();
-    if (u.includes("douyin.com") || u.includes("v.douyin")) return "Douyin";
-    if (u.includes("xiaohongshu.com") || u.includes("xhslink.com"))
-      return "Xiaohongshu";
-    if (u.includes("tiktok.com")) return "TikTok";
-    if (u.includes("instagram.com")) return "Instagram";
-    if (
-      u.includes("facebook.com") ||
-      u.includes("fb.watch") ||
-      u.includes("fb.com")
-    )
-      return "Facebook";
-    if (u.includes("youtube.com") || u.includes("youtu.be")) return "YouTube";
-    if (u.includes("twitter.com") || u.includes("x.com")) return "Twitter/X";
-    if (u.includes("threads.net")) return "Threads";
-    return "Social Media";
-  };
-
   const platformMessages: Record<string, string> = {
     TikTok: "Đang trích xuất video TikTok (No Watermark)...",
     Douyin: "Đang trích xuất video Douyin...",
     YouTube: "Đang phân tích video YouTube...",
-    Instagram: "Đang lấy video Instagram (yêu cầu public post)...",
+    Instagram: "Đang lấy video Instagram...",
     Facebook: "Đang lấy video Facebook...",
     "Twitter/X": "Đang trích xuất video Twitter/X...",
     Threads: "Đang trích xuất video Threads...",
@@ -781,60 +1127,12 @@ export default function App() {
     setIsLoading(true);
     setError(null);
 
-    // Detect platform for status message
-    const u = url.toLowerCase();
-    let platform = "Social Media";
-    if (u.includes("tiktok.com")) platform = "TikTok";
-    else if (u.includes("douyin.com")) platform = "Douyin";
-    else if (u.includes("youtube.com") || u.includes("youtu.be"))
-      platform = "YouTube";
-    else if (u.includes("instagram.com")) platform = "Instagram";
-    else if (u.includes("facebook.com") || u.includes("fb.watch"))
-      platform = "Facebook";
-    else if (u.includes("twitter.com") || u.includes("x.com"))
-      platform = "Twitter/X";
-    else if (u.includes("threads.net")) platform = "Threads";
-    else if (u.includes("reddit.com") || u.includes("redd.it"))
-      platform = "Reddit";
-    else if (u.includes("xiaohongshu") || u.includes("xhslink"))
-      platform = "Xiaohongshu";
-
+    const platform = detectPlatform(url);
     setLoadingStatus(platformMessages[platform] || "Đang phân tích link...");
 
     try {
-      setLoadingStatus(platformMessages[platform] || "Đang phân tích link...");
-      const response = await fetch("/api/fetch-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to fetch video information");
-      }
-
-      let finalMetadata = data.metadata;
-
-      // If the backend couldn't find a direct link, try Gemini extraction
-      if (finalMetadata.needsExtraction || !finalMetadata.downloadUrl) {
-        setLoadingStatus("Đang dùng AI để tìm link tải...");
-        const extractedLink = await extractVideoLinkWithGemini(
-          url,
-          finalMetadata.platform,
-        );
-        if (extractedLink) {
-          finalMetadata.downloadUrl = extractedLink;
-          finalMetadata.needsExtraction = false;
-        } else if (!finalMetadata.downloadUrl) {
-          throw new Error(
-            `Không tìm được link tải cho video ${finalMetadata.platform} này. Hãy thử link khác hoặc kiểm tra xem video có ở chế độ công khai không.`,
-          );
-        }
-      }
-
-      setMetadata(finalMetadata);
+      const result = await fetchVideoMetadataClient(url);
+      setMetadata(result);
       setScreen("success");
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (err: any) {
@@ -846,43 +1144,15 @@ export default function App() {
     }
   };
 
-  const triggerFileDownload = async (downloadUrl: string, filename: string) => {
-    const safeFilename = filename || "video.mp4";
-    const proxyUrl =
-      `/api/proxy?url=${encodeURIComponent(downloadUrl)}` +
-      `&filename=${encodeURIComponent(safeFilename)}`;
-
+  const handleTriggerDownload = async (
+    downloadUrl: string,
+    filename: string,
+  ) => {
     try {
-      // Pre-check: fetch via HEAD-like test (small fetch to detect errors before full download)
-      const checkRes = await fetch(proxyUrl, { method: "GET" });
-
-      if (!checkRes.ok) {
-        // Read error message from server
-        const errText = await checkRes.text();
-        setError(
-          `Không thể tải video (lỗi ${checkRes.status}): ${errText.substring(0, 200)}. ` +
-            `Thử nhấn "Download Another Video" và dán link lại để lấy link mới.`,
-        );
-        return;
-      }
-
-      // Stream succeeded — create blob URL and trigger download
-      const blob = await checkRes.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = safeFilename;
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
-      }, 1000);
+      await triggerDownload(downloadUrl, filename);
     } catch (err: any) {
       setError(
-        `Lỗi khi tải xuống: ${err.message}. ` +
-          `Vui lòng thử lại hoặc nhấn "Download Another Video" để lấy link mới.`,
+        `Lỗi khi tải xuống: ${err.message}. Hãy thử nút "Open Direct Link" để mở video trực tiếp.`,
       );
     }
   };
@@ -896,8 +1166,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col font-sans">
-      <Header onGetStarted={() => handleReset()} />
-
+      <Header onGetStarted={handleReset} />
       <main className="flex-1">
         {screen === "landing" ? (
           <LandingScreen
@@ -911,13 +1180,12 @@ export default function App() {
             <SuccessScreen
               metadata={metadata}
               onReset={handleReset}
-              onDownload={triggerFileDownload}
+              onDownload={handleTriggerDownload}
               downloadError={error}
             />
           )
         )}
       </main>
-
       <Footer />
     </div>
   );
